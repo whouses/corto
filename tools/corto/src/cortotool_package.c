@@ -3,220 +3,288 @@
 #include "cortotool_build.h"
 
 static corto_object cortotool_lookupPackage(corto_string str) {
-	corto_object package = corto_resolve(NULL, str);
-	if (!package) {
-		corto_error("corto: package '%s' not be found", str);
-		goto error;
-	}
+    corto_object package = corto_resolve(NULL, str);
+    if (!package) {
+        corto_seterr("package '%s' not be found", str);
+        goto error;
+    }
 
-	if (!corto_instanceof(corto_package_o, package)) {
-		corto_error("corto: object '%s' is not a package", str);
-		goto error;
-	}
+    if (!corto_instanceof(corto_package_o, package)) {
+        corto_seterr("object '%s' is not a package", str);
+        goto error;
+    }
 
-	return package;	
+    return package;
 error:
-	return NULL;
+    return NULL;
 }
 
 corto_int16 cortotool_add(int argc, char* argv[]) {
-	int nameElem = 1;
-	corto_id id;
-	corto_bool isComponent = FALSE, isSilent = FALSE, noBuild = FALSE;
+    corto_ll silent, mute, nobuild, project, packages, components;
+    corto_bool build = FALSE;
+    CORTO_UNUSED(argc);
 
-	if ((argc > 2) && (*argv[2] != '-')) {
-		corto_chdir(argv[1]);
-		nameElem = 2;
-	}
+    corto_argdata *data = corto_argparse(
+      argv,
+      (corto_argdata[]){
+        /* Ignore first argument */
+        {"$0", NULL, NULL},
+        {"--silent", &silent, NULL},
+        {"--mute", &mute, NULL},
+        {"--nobuild", &nobuild, NULL},
 
-	if (argc > (nameElem + 1)) {
-		corto_int32 i = 0;
-		for (i = nameElem + 1; i < argc; i++) {
-			if (!strcmp(argv[i], "--component")) {
-				isComponent = TRUE;
-			} else if (!strcmp(argv[i], "--silent")) {
-				isSilent = TRUE;
-			} else if (!strcmp(argv[i], "--nobuild")) {
-				noBuild = TRUE;
-			}
-		}
-	}
+        /* Match at most one project directory */
+        {"$?*", &project, NULL},
 
-	if (isComponent) {
-		/* Test whether component exists */
-		corto_string component = corto_locateComponent(argv[nameElem]);
-		if (!component) {
-			corto_error("corto: component '%s' not found", argv[nameElem]);
-			goto error;
-		}
+        /* At least one package or component must be specified */
+        {"$+package", NULL, &packages},
+        {"$|component", NULL, &components},
+        {"$|*", &packages, NULL},
+        {NULL}
+      }
+    );
 
-		if (!corto_loadRequiresComponent(argv[nameElem])) {
-			corto_mkdir(".corto");
-			corto_file f = corto_fileAppend(".corto/components.txt");
-			if (!f) {
-				corto_error("corto: failed to open .corto/components.txt (check permissions)");
-				corto_dealloc(component);
-				goto error;
-			}
-			fprintf(corto_fileGet(f), "%s\n", argv[nameElem]);
-			corto_fileClose(f);
+    if (!data) {
+        goto error;
+    }
 
-			if (!noBuild) {
-				cortotool_build(argc - 1, &argv[1]);
-			}
+    /* Move to project directory */
+    if (project) {
+        if (corto_chdir(corto_llGet(project, 0))) {
+            goto error;
+        }
+    }
 
-			if (!isSilent) {
-				printf("corto: component '%s' added to project\n", argv[nameElem]);
-			}
-		} else {
-			if (!isSilent) {
-				printf("corto: component '%s' is already added to the project\n", argv[nameElem]);
-			}
-		}
+    /* Load components */
+    if (components) {
+        corto_iter iter = corto_llIter(components);
+        while (corto_iterHasNext(&iter)) {
+            corto_string arg = corto_iterNext(&iter);
+            corto_string component = corto_locateComponent(arg);
 
-		corto_dealloc(component);
+            if (!component) {
+                corto_seterr("component '%s' not found", arg);
+                goto error;
+            }
 
-	} else {
-		/* Test whether package exists */
-		corto_object package = cortotool_lookupPackage(argv[nameElem]);
-		if (!package) {
-			goto error;
-		}
+            if (!corto_loadRequiresComponent(arg)) {
+                corto_mkdir(".corto");
+                corto_file f = corto_fileAppend(".corto/components.txt");
+                if (!f) {
+                    corto_seterr("failed to open .corto/components.txt (check permissions)");
+                    corto_dealloc(component);
+                    goto error;
+                }
 
-		/* Use fully scoped name from here */
-		if (!corto_loadRequiresPackage(corto_fullname(package, id))) {
-			corto_mkdir(".corto");
-			corto_file f = corto_fileAppend(".corto/packages.txt");
-			if (!f) {
-				corto_error("corto: failed to open .corto/packages.txt (check permissions)");
-				corto_release(package);
-				goto error;
-			}
-			fprintf(corto_fileGet(f), "%s\n", id);
-			corto_fileClose(f);
+                fprintf(corto_fileGet(f), "%s\n", arg);
+                corto_fileClose(f);
+                build = TRUE;
 
-			if (!noBuild) {
-				cortotool_build(argc - 1, &argv[1]);
-			}
+                if (!silent) {
+                    corto_print("corto: component '%s' added to project", arg);
+                }
+            } else {
+                if (!silent) {
+                    corto_print(
+                        "corto: component '%s' is already added to the project",
+                        arg);
+                }
+            }
+            corto_dealloc(component);
+        }
+    }
 
-			if (!isSilent) {
-				printf("corto: package '%s' added to project\n", id);
-			}
-		} else {
-			if (!isSilent) {
-				printf("corto: package '%s' is already added to the project\n", id);
-			}
-		}
+    /* Load packages */
+    if (packages) {
+        corto_iter iter = corto_llIter(packages);
+        while (corto_iterHasNext(&iter)) {
+            /* Test whether package exists */
+            corto_object package =
+                cortotool_lookupPackage(corto_iterNext(&iter));
+            if (!package) {
+                goto error;
+            }
 
-		corto_release(package);
-	}
+            /* Use fully scoped name from here */
+            corto_id id;
+            if (!corto_loadRequiresPackage(corto_fullpath(id, package))) {
+                corto_mkdir(".corto");
+                corto_file f = corto_fileAppend(".corto/packages.txt");
+                if (!f) {
+                    corto_seterr("failed to open .corto/packages.txt (check permissions)");
+                    corto_release(package);
+                    goto error;
+                }
+                fprintf(corto_fileGet(f), "%s\n", id);
+                corto_fileClose(f);
+                build = TRUE;
 
-	return 0;
+                if (!silent) {
+                    printf("corto: package '%s' added to project\n", id);
+                }
+            } else {
+                if (!silent) {
+                    printf("corto: package '%s' is already added to the project\n", id);
+                }
+            }
+
+            corto_release(package);
+        }
+    }
+
+    if (build && !nobuild) {
+        cortotool_build(3, (char*[]){
+          "build",
+          silent ? "--silent" : "",
+          mute ? "--mute" : "",
+          NULL
+        });
+    }
+
+    corto_argclean(data);
+
+    return 0;
 error:
-	return -1;
+    corto_error("corto: add: %s", corto_lasterr());
+    return -1;
 }
 
 static corto_bool cortotool_removeEntry(corto_file file, corto_ll list, corto_string entry) {
-	corto_bool found = FALSE;
-	corto_iter iter = corto_llIter(list);
+    corto_bool found = FALSE;
+    corto_iter iter = corto_llIter(list);
 
-	while (corto_iterHasNext(&iter)) {
-		corto_string str = corto_iterNext(&iter);
-		if (strcmp(str, entry)) {
-			fprintf(corto_fileGet(file), "%s\n", str);
-		} else {
-			found = TRUE;
-		}
-	}
+    while (corto_iterHasNext(&iter)) {
+        corto_string str = corto_iterNext(&iter);
+        if (strcmp(str, entry)) {
+            fprintf(corto_fileGet(file), "%s\n", str);
+        } else {
+            found = TRUE;
+        }
+    }
 
-	return found;
+    return found;
 }
 
 corto_int16 cortotool_remove(int argc, char* argv[]) {
-	int nameElem = 1;
-	corto_bool found = FALSE;
-	corto_file file;
-	corto_bool isComponent = FALSE;
+    corto_ll silent, mute, nobuild, project, packages, components, group;
+    corto_bool build = FALSE;
 
-	if ((argc > 2) && (*argv[2] != '-')) {
-		corto_chdir(argv[1]);
-		nameElem = 2;
-	}
+    CORTO_UNUSED(argc);
 
-	if (argc > (nameElem + 1)) {
-		if (argv[nameElem + 1]) {
-			if (!strcmp(argv[nameElem + 1], "--component")) {
-				isComponent = TRUE;
-			}
-		}
-	}
+    corto_argdata *data = corto_argparse(
+      argv,
+      (corto_argdata[]){
+        /* Ignore first argument */
+        {"$0", NULL, NULL},
+        {"--silent", &silent, NULL},
+        {"--mute", &mute, NULL},
+        {"--nobuid", &nobuild, NULL},
 
-	if (isComponent) {
-		corto_ll components = corto_loadGetComponents();
-		file = corto_fileOpen(".corto/components.txt");
-		found = cortotool_removeEntry(file, components, argv[nameElem]);
-		corto_fileClose(file);
-		corto_loadFreePackages(components);
+        /* Match at most one project directory */
+        {"$?*", &project, NULL},
 
-		if (!found) {
-			corto_error("corto: '%s' not found in components file", argv[nameElem]);
-			goto error;
-		} else {
-			cortotool_build(argc - 1, &argv[1]);
-			printf("corto: component '%s' removed from project\n", argv[nameElem]);
-		}
-	} else {
-		corto_id id;
-		corto_object package = cortotool_lookupPackage(argv[nameElem]);
-		if (!package) {
-			goto error;
-		}
+        /* 'group' ensures there's AT LEAST one package OR component */
+        {"$+package", &group, &packages},
+        {"$+component", &group, &components},
+        {"$+*", &packages, &group},
+        {NULL}
+      }
+    );
 
-		corto_fullname(package, id);
-		corto_ll packages = corto_loadGetPackages();
+    /* Move to project directory */
+    if (project) {
+        if (corto_chdir(corto_llGet(project, 0))) {
+            goto error;
+        }
+    }
 
-		file = corto_fileOpen(".corto/packages.txt");
-		found = cortotool_removeEntry(file, packages, id);
-		corto_fileClose(file);
-		corto_loadFreePackages(packages);
+    if (components) {
+        corto_iter iter = corto_llIter(components);
+        while (corto_iterHasNext(&iter)) {
+            corto_string arg = corto_iterNext(&iter);
+            corto_ll components = corto_loadGetComponents();
+            corto_file file = corto_fileOpen(".corto/components.txt");
+            corto_bool found = cortotool_removeEntry(file, components, arg);
+            corto_fileClose(file);
+            corto_loadFreePackages(components);
 
-		if (!found) {
-			corto_error("corto: '%s' ('%s') not found in package file", argv[nameElem], id);
-			goto error;
-		} else {
-			cortotool_build(argc - 1, &argv[1]);
-			printf("corto: package '%s' removed from project\n", id);
-		}
-	}
+            if (!found) {
+                corto_error("corto: '%s' not found in components file", arg);
+                goto error;
+            } else {
+                build = TRUE;
+                printf("corto: component '%s' removed from project\n", arg);
+            }
+        }
+    }
 
-	return 0;
+    if (packages) {
+        corto_iter iter = corto_llIter(packages);
+        while (corto_iterHasNext(&iter)) {
+            corto_string arg = corto_iterNext(&iter);
+            corto_object package = cortotool_lookupPackage(arg);
+            if (!package) {
+                goto error;
+            }
+
+            corto_id id;
+            corto_fullpath(id, package);
+
+            corto_ll packages = corto_loadGetPackages();
+            corto_file file = corto_fileOpen(".corto/packages.txt");
+            corto_bool found = cortotool_removeEntry(file, packages, id);
+            corto_fileClose(file);
+            corto_loadFreePackages(packages);
+
+            if (!found) {
+                corto_error("corto: '%s' ('%s') not found in package file", arg, id);
+                goto error;
+            } else {
+                build = TRUE;
+                printf("corto: package '%s' removed from project\n", id);
+            }
+        }
+    }
+
+    if (build && !nobuild) {
+        cortotool_build(3, (char*[]){
+          "build",
+          silent ? "--silent" : "",
+          mute ? "--mute" : "",
+          NULL
+        });
+    }
+
+    corto_argclean(data);
+
+    return 0;
 error:
-	return -1;
+    return -1;
 }
 
 corto_int16 cortotool_list(int argc, char* argv[]) {
-	if (argc > 1) {
-		corto_chdir(argv[1]);
-	}
+    if (argc > 1) {
+        corto_chdir(argv[1]);
+    }
 
-	corto_ll packages = corto_loadGetPackages();
+    corto_ll packages = corto_loadGetPackages();
 
-	if (packages && corto_llSize(packages)) {
-		corto_iter iter = corto_llIter(packages);
-		printf("packages:\n");
-		while (corto_iterHasNext(&iter)) {
-			corto_string str = corto_iterNext(&iter);
-			printf("  %s  =>  %s\n", str, corto_locate(str));
-		}
-	} else {
-		printf("corto: no packages to list\n");
-	}
+    if (packages && corto_llSize(packages)) {
+        corto_iter iter = corto_llIter(packages);
+        printf("packages:\n");
+        while (corto_iterHasNext(&iter)) {
+            corto_string str = corto_iterNext(&iter);
+            printf("  %s  =>  %s\n", str, corto_locate(str));
+        }
+    } else {
+        printf("corto: no packages to list\n");
+    }
 
-	if (packages) {
-		corto_loadFreePackages(packages);
-	}
+    if (packages) {
+        corto_loadFreePackages(packages);
+    }
 
-	return 0;
+    return 0;
 }
 
 void cortotool_addHelp(void) {

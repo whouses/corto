@@ -7,27 +7,31 @@ end
 
 ARTEFACT = "app"
 TARGETDIR = "./.corto"
-USE_LIBRARY ||= []
+USE_PACKAGE ||= []
 LIBPATH ||= []
 INCLUDE ||= []
 
 GENERATED_SOURCES ||= []
+GENERATED_HEADERS ||= []
 
-GENERATED_SOURCES << ".corto/#{TARGET}__load.c"
+GENERATED_SOURCES << ".corto/_load.c"
+GENERATED_HEADERS << "include/_interface.h"
 
-USE_LIBRARY << "corto"
+USE_PACKAGE << "corto"
 INCLUDE <<
     "#{ENV['CORTO_HOME']}/include/corto/#{VERSION}" <<
-    "#{ENV['CORTO_HOME']}/include/corto/#{VERSION}/packages/corto/lang"
+    "#{ENV['CORTO_HOME']}/include/corto/#{VERSION}/packages/corto/lang" <<
+    "include"
+
 
 CLOBBER.include ".corto/#{TARGET}.h"
 
-file ".corto/#{TARGET}__load.c" => [".corto/packages.txt", ".corto/components.txt"] do
+file ".corto/_load.c" => [".corto/packages.txt", ".corto/components.txt"] do
     verbose(false)
     sh "mkdir -p .corto"
-    sh "corto pp --name #{TARGET} -g c_project"
+    sh "corto pp --name #{TARGET} --attr local=true --attr h=include -g c_project"
 end
 
-task :prebuild => ".corto/#{TARGET}__load.c"
+task :prebuild => ".corto/_load.c"
 
 require "#{ENV['CORTO_BUILD']}/artefact"

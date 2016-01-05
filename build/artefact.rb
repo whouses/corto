@@ -14,7 +14,9 @@ end
 if not defined? ARTEFACT then
     raise "artefact: ARTEFACT not specified\n"
 end
-
+if not ENV['target'] then
+    ENV['target'] = "debug"
+end
 
 # --- DATA PROCESSING
 
@@ -29,16 +31,27 @@ def corto_replace(str)
 end
 
 # Public variables
-INCLUDE ||= []
+INCLUDE ||= ["include"]
 LIB ||= []
 LIBPATH ||= []
 LINK ||= []
 CFLAGS ||= []
+CXXFLAGS ||= []
 LFLAGS ||= []
 USE_PACKAGE ||= []
 USE_COMPONENT ||= []
 USE_LIBRARY ||= []
 DEFINE ||= []
+CC ||= if ENV['CC'].nil? or ENV['CC'].empty?
+  "cc"
+else
+  ENV['CC']
+end
+CXX ||= if ENV['CXX'].nil? or ENV['CXX'].empty?
+  "g++"
+else
+  ENV['CXX']
+end
 
 # Private variables
 TARGETDIR ||= ENV['CORTO_TARGET'] + "/lib"
@@ -50,17 +63,33 @@ USE_COMPONENT_LOADED ||=[]
 # Add default include paths
 INCLUDE <<
     "src" <<
-    "include" <<
     "#{ENV['CORTO_TARGET']}/include/corto/#{VERSION}/packages" <<
     "/usr/local/include/corto/#{VERSION}/packages"
 
 # Default CFLAGS
-CFLAGS << "-g" << "-Wstrict-prototypes" << "-std=c99" << "-pedantic" << "-fPIC" << "-D_XOPEN_SOURCE=600"
+CFLAGS << "-std=c99" << "-Wstrict-prototypes" << "-pedantic" << "-fPIC" << "-D_XOPEN_SOURCE=600"
 CFLAGS.unshift("-Wall")
 
-# Obtain list of source and object files
-SOURCES = Rake::FileList["src/*.c"] + GENERATED_SOURCES
-OBJECTS = SOURCES.ext(".o").pathmap(".corto/obj/%f")
+# Default CXXFLAGS
+CXXFLAGS << "-Wall" << "-std=c++11"
+
+# Set NDEBUG macro in release builds to disable tracing & checking
+# Also enable optimizations
+if ENV['target'] == "release" then
+  CFLAGS << "-DNDEBUG" << "-O3"
+  CXXFLAGS << "-DNDEBUG" << "-O3"
+end
+
+# Enable debug information in debug builds & disable optimizations
+if ENV['target'] == "debug" then
+  CFLAGS << "-g" << "-O0"
+  CXXFLAGS << "-g" << "-O0"
+end
+
+# Crawl src directory to get list of source files
+SOURCES = Rake::FileList["src/**/*.{c,cc,cpp,cxx}"]
+OBJECTS = SOURCES.ext(".o").pathmap(".corto/%{^src/,obj/}p") +
+          Rake::FileList[GENERATED_SOURCES].ext(".o").pathmap(".corto/obj/%f")
 
 # Load components from file
 if File.exists? ".corto/components.txt" then
@@ -159,27 +188,36 @@ file "#{TARGETDIR}/#{ARTEFACT}" => OBJECTS do
     lflags = "#{LFLAGS.join(" ")} -o #{TARGETDIR}/#{ARTEFACT}"
     use_link =
         USE_PACKAGE.map do |i|
-            result = `corto locate #{i} --lib`[0...-1]
-            if $?.exitstatus != 0 then
-                p result
-                abort "\033[1;31m[ build failed ]\033[0;49m"
+            if i == "corto" then
+                "#{ENV['CORTO_HOME']}/lib/corto/#{VERSION}/packages/corto/libcorto.so"
+            else
+                result = `corto locate #{i} --lib`[0...-1]
+                if $?.exitstatus != 0 then
+                    p result
+                    abort "\033[1;31m[ build failed ]\033[0;49m"
+                end
+                result
             end
-            result
         end.join(" ") + " " +
         USE_COMPONENT.map {|i| "#{ENV['CORTO_HOME']}/lib/corto/#{VERSION}/components/lib" + i + ".so"}.join(" ") + " " +
         USE_LIBRARY.map {|i| "#{ENV['CORTO_HOME']}/lib/corto/#{VERSION}/libraries/lib" + i + ".so"}.join(" ")
 
     # Check if there were any new files created during code generation
     Rake::FileList["src/*.c"].each do |file|
-        if not SOURCES.include? file
-            obj = file.ext(".o").pathmap(".corto/obj/%f")
+        obj = file.ext(".o").pathmap(".corto/obj/%f")
+        if not OBJECTS.include? obj
             build_source(file, obj, true)
             objects += " " + obj
         end
     end
 
-    cc_command = "cc #{objects} #{cflags} #{libpath} #{libmapping} #{use_link} #{lflags}"
-    sh cc_command
+    cc_command = "#{CC} #{objects} #{cflags} #{libpath} #{libmapping} #{use_link} #{lflags}"
+    begin
+      sh cc_command
+    rescue
+      puts "\033[1;31mcommand failed: #{cc_command}\033[0;49m"
+      abort()
+    end
 
     # If required, alter paths to dylib files
     LINKED.each do |lib|
@@ -194,8 +232,23 @@ file "#{TARGETDIR}/#{ARTEFACT}" => OBJECTS do
         end
     end
 
+    # If target is release, strip binary
+    if ENV['target'] == "release" then
+      sh "strip -Sx #{TARGETDIR}/#{ARTEFACT}"
+    end
+
+    if ENV['target'] == "release" then
+      c_bold = "\033[1;36m"
+      c_name = "\033[1;49m"
+      c_normal = "\033[0;49m"
+    else
+      c_bold = "\033[1;49m"
+      c_name = "\033[1;34m"
+      c_normal = "\033[0;49m"
+    end
+
     if ENV['silent'] != "true" then
-        sh "echo '\033[1;49m[ \033[1;34m#{ARTEFACT}\033[0;49m\033[1;49m ]\033[0;49m'"        
+        sh "echo '#{c_bold}[ #{c_normal}#{c_name}#{ARTEFACT}#{c_normal}#{c_bold} ]#{c_normal}'"
     end
 end
 
@@ -213,25 +266,43 @@ task :all => :default
 # Run test for project
 task :test do
     verbose(false)
-    sh "corto test"
+    begin
+      sh "corto test"
+    rescue
+      abort
+    end
 end
 
 # Rules for generated files
-rule '__api.o' => ->(t){t.pathmap(".corto/%f").ext(".c")} do |task|
+rule '_api.o' => ->(t){t.pathmap(".corto/%f").ext(".c")} do |task|
     build_source(task.source, task.name, false)
 end
-rule '__meta.o' => ->(t){t.pathmap(".corto/%f").ext(".c")} do |task|
+rule '_meta.o' => ->(t){t.pathmap(".corto/%f").ext(".c")} do |task|
     build_source(task.source, task.name, false)
 end
-rule '__wrapper.o' => ->(t){t.pathmap(".corto/%f").ext(".c")} do |task|
+rule '_wrapper.o' => ->(t){t.pathmap(".corto/%f").ext(".c")} do |task|
     build_source(task.source, task.name, false)
 end
-rule '__load.o' => ->(t){t.pathmap(".corto/%f").ext(".c")} do |task|
+rule '_load.o' => ->(t){t.pathmap(".corto/%f").ext(".c")} do |task|
     build_source(task.source, task.name, false)
 end
 
 # Generic rule for translating source files into object files
-rule '.o' => ->(t) {t.pathmap("src/%f").ext(".c")} do |task|
+rule '.o' => ->(t) {
+    files = Rake::FileList["src/**/*.{c,cc,cpp,cxx}"]
+    file = nil
+    files.each do |e|
+      base = File.join(File.dirname(t), File.basename(t, '.*'))
+      if e.pathmap("%{^src/,.corto/obj/}X") == base then
+          file = e
+          break;
+      end
+    end
+    if file == nil then
+        file = t.pathmap("src/%f").ext(".c")
+    end
+    file
+} do |task|
     build_source(task.source, task.name, true)
 end
 
@@ -240,14 +311,34 @@ end
 # Utility for building a sourcefile
 def build_source(source, target, echo)
     verbose(false)
-    if not File.exists? ".corto/obj" then
-        sh "mkdir -p .corto/obj"
+    flags = ""
+    cc = ""
+
+    # Can't use extname because of files with multiple periods in their name
+    if source.split(".").last == "c" then
+        flags = CFLAGS
+        cc = CC
+    else
+        flags = CXXFLAGS
+        cc = CXX
     end
+
+    path = File.dirname(target)
+    if not File.exists? path then
+        sh "mkdir -p #{path}"
+    end
+
     if echo
         if ENV['silent'] != "true" then
             sh "echo '#{source}'"
         end
     end
-    sh "cc -c #{CFLAGS.join(" ")} #{DEFINE.map {|d| "-D" + d}.join(" ")} #{INCLUDE.map {|i| "-I" + i}.join(" ")} #{source} -o #{target}"
-end
 
+    cc_command = "#{cc} -c #{flags.join(" ")} #{DEFINE.map {|d| "-D" + d}.join(" ")} #{INCLUDE.map {|i| "-I" + i}.join(" ")} #{source} -o #{target}"
+    begin
+      sh cc_command
+    rescue
+      puts "\033[1;31mcommand failed: #{cc_command}\033[0;49m"
+      abort()
+    end
+end

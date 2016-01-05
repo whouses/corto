@@ -5,20 +5,16 @@
  *      Author: sander
  */
 
-#include "corto.h"
-#include "corto_convert.h"
-#include "corto_string_ser.h"
-#include "corto_metawalk.h"
-#include "corto_class.h"
-#include "corto_loader.h"
-#include "corto_err.h"
+#include "cortotool_shell.h"
+#include "cortotool_shellengine.h"
+#include "ctype.h"
+#include "fnmatch.h"
 
 #define CXSH_CMD_MAX (1024)
 
 #define CXSH_COL_NAME     (46)
-#define CXSH_COL_TYPE     (22)
-#define CXSH_COL_STATE    (12)
-#define CXSH_COL_TOTAL    (CXSH_COL_NAME + CXSH_COL_TYPE + CXSH_COL_STATE)
+#define CXSH_COL_TYPE     (32)
+#define CXSH_COL_TOTAL    (CXSH_COL_NAME + CXSH_COL_TYPE)
 
 #define BLACK   "\033[1;30m"
 #define RED     "\033[1;31m"
@@ -34,22 +30,17 @@
 
 #define SHELL_COLOR (BOLD)
 #define ERROR_COLOR (RED)
-#define TYPE_COLOR (GREEN)
-#define OBJECT_COLOR (BLUE)
+#define TYPE_COLOR (MAGENTA)
+#define OBJECT_COLOR (CYAN)
 #define META_COLOR (MAGENTA)
 #define INTERFACE_COLOR (BOLD)
 #define HEADER_COLOR (BOLD)
 
-static corto_object scope = NULL;
+static corto_id scope;
 
 /* Print color */
 static void cxsh_color(const char *string) {
     printf("%s", string);
-}
-
-/* Print a column of certain length */
-static void cxsh_printColumn(corto_string str, int width){
-    printf("%s%*s", str, (int)(width - strlen(str)), " ");
 }
 
 /* Find preferred character on which to break a string, in case it's too long
@@ -73,7 +64,7 @@ static corto_string cxsh_findPreferredBreak(corto_string str) {
     }
 
     /* If no breakpoints were found, look again for scope operators. The reason
-     * to not check for these in the first run is because it is preferred that 
+     * to not check for these in the first run is because it is preferred that
      * identifiers are on one line. */
     if (breakpt == (str + strlen(str))) {
         while ((ch = *ptr)) {
@@ -112,49 +103,37 @@ static corto_string cxsh_printColumnValue(corto_string str, unsigned int width){
     return result;
 }
 
-static void cxsh_printColumnBar(int width) {
-    while (width) {
-        printf("=");
-        width--;
-    }
-    printf("\n");
-}
-
-static void cxsh_printColumnHeader(void) {
-    printf("  ");
-    cxsh_printColumn("name", CXSH_COL_NAME);
-    cxsh_printColumn("type", CXSH_COL_TYPE);
-    cxsh_printColumn("state", CXSH_COL_STATE);
-    cxsh_color(INTERFACE_COLOR);
-    printf("\n");
-    cxsh_printColumnBar(CXSH_COL_TOTAL);
-    cxsh_color(NORMAL);
-}
-
 /* Print shell prompt */
-static void cxsh_prompt(corto_object scope, int enableColors, corto_id prompt) {
-    corto_id name;
-    corto_fullname(scope, name);
+static void cxsh_prompt(int enableColors, corto_id prompt) {
     if (enableColors) {
-        sprintf(prompt, "%s%s%s %s$%s ", OBJECT_COLOR, name, NORMAL, SHELL_COLOR, NORMAL);
+        sprintf(prompt, "%s%s%s %s$%s ", OBJECT_COLOR, scope, NORMAL, SHELL_COLOR, NORMAL);
     } else {
-        sprintf(prompt, "%s $ ", name);
+        sprintf(prompt, "%s $ ", scope);
     }
 }
 
 /* Translate object state to string */
 static char* cxsh_stateStr(corto_object o, char* buff) {
     buff[0] = '\0';
+    corto_int8 appended = 0;
 
     /* Get state */
     if (corto_checkState(o, CORTO_VALID)) {
        strcpy(buff, "V");
+       appended++;
     }
     if (corto_checkState(o, CORTO_DECLARED)) {
-       strcat(buff, "|DCL");
+        if (appended) {
+            strcat(buff, "|");
+        }
+        strcat(buff, "DCL");
+        appended++;
     }
     if (corto_checkState(o, CORTO_DEFINED)) {
-       strcat(buff, "|DEF");
+        if (appended) {
+            strcat(buff, "|");
+        }
+        strcat(buff, "DEF");
     }
 
     return buff;
@@ -197,31 +176,56 @@ static char* cxsh_attrStr(corto_object o, char* buff) {
     return buff;
 }
 
-static int cxsh_scopeWalk(corto_object o, void* udata) {
-    corto_id typeName;
-    corto_string remaining = 0;
-    char state[sizeof("valid | declared | defined")];
-    CORTO_UNUSED(udata);
+/* Return path relative to current scope */
+static corto_string cxsh_pathstr(
+    corto_id buff,
+    corto_string parent,
+    corto_string name)
+{
+    int scopeLen = strlen(scope);
+    buff[0] = '\0';
 
-    /* Get name of type */
-    if (corto_checkAttr(corto_typeof(o), CORTO_ATTR_SCOPED) && (corto_parentof(corto_typeof(o)) == corto_lang_o)) {
-        strcpy(typeName, corto_nameof(corto_typeof(o)));
+    if (!memcmp(parent, scope, strlen(scope))) {
+        strcpy(buff, &parent[scopeLen]);
+        if (strlen(buff)) {
+            strcat(buff, "/");
+            strcat(buff, name);
+        } else {
+            strcpy(buff, name);
+        }
     } else {
-        corto_fullname(corto_typeof(o), typeName);
+        if (strcmp(scope, "/")) {
+            sprintf(buff, "%s/%s/%s", scope, parent, name);
+        } else {
+            sprintf(buff, "%s/%s", parent, name);
+        }
+    }
+    if (!strcmp(parent, ".")) {
+        strcpy(buff, name);
     }
 
+    return buff;
+}
+
+static int cxsh_printRow(corto_string parent, corto_string name, corto_string type) {
+    corto_string remaining = 0;
+    corto_string objcolor = OBJECT_COLOR;
+    corto_int32 colName = CXSH_COL_NAME;
+
     /* Print columns */
-    printf("  ");
-    cxsh_color(OBJECT_COLOR); remaining = cxsh_printColumnValue(corto_nameof(o), CXSH_COL_NAME); cxsh_color(NORMAL);
-    cxsh_color(TYPE_COLOR); cxsh_printColumnValue(typeName, CXSH_COL_TYPE); cxsh_color(NORMAL);
-    cxsh_color(META_COLOR);
-    cxsh_printColumnValue(cxsh_stateStr(o, state), CXSH_COL_STATE);
+    cxsh_color(objcolor);
+    if (strcmp(parent, scope) && strcmp(parent, ".")) {
+        printf("%s/", parent);
+        colName -= strlen(parent) + 1;
+    }
+    remaining = cxsh_printColumnValue(name, colName);
     cxsh_color(NORMAL);
+    cxsh_color(TYPE_COLOR); printf("%s", type); cxsh_color(NORMAL);
     printf("\n");
 
     /* Print remainder of the name */
     while (remaining) {
-        cxsh_color(OBJECT_COLOR);
+        cxsh_color(objcolor);
         printf("    ");
         remaining = cxsh_printColumnValue(remaining, CXSH_COL_NAME - 4);
         cxsh_color(NORMAL);
@@ -232,148 +236,86 @@ static int cxsh_scopeWalk(corto_object o, void* udata) {
 
 /* List scope */
 static void cxsh_ls(char* arg) {
-    corto_object o;
-    corto_uint32 scopeSize;
+    corto_iter iter;
+    corto_id buff;
+    corto_uint32 i = 0;
+    corto_id prefix;
 
-    if (arg && strlen(arg)) {
-        o = corto_resolve(scope, arg);
-        if (!o) {
-            cxsh_color(ERROR_COLOR);
-            corto_error("expression '%s' did not resolve to object.", arg);
-            cxsh_color(NORMAL);
-            return;
+    if (strcmp(scope, "/")) {
+        strcpy(prefix, scope);
+        strcat(prefix, "/");
+    } else {
+        *prefix = '\0';
+    }
+
+    if (arg) {
+        char lastCh = arg[strlen(arg) - 1];
+        if ((lastCh != '/') && (lastCh != '.') && (lastCh != '*') && (lastCh != '?')) {
+            sprintf(buff, "%s%s/*", prefix, arg);
+        } else {
+            sprintf(buff, "%s%s", prefix, arg);
         }
     } else {
-        o = scope;
-        corto_claim(o);
+        sprintf(buff, "%s*", prefix);
     }
 
-    /* Print column header */
-    cxsh_printColumnHeader();
-
-    if ((scopeSize = corto_scopeSize(o))) {
-        /* Walk scope, print contents */
-        corto_scopeWalk(o, cxsh_scopeWalk, NULL);
-
-        if (scopeSize == 1) {
-            printf("total: %d object\n", scopeSize);
-        } else {
-            printf("total: %d objects\n", scopeSize);
-        }
+    if (corto_select(root_o, buff, &iter)) {
+        corto_error("error: %s", corto_lasterr());
     } else {
-        printf("no objects.\n");
-    }
-
-    corto_release(o);
-}
-
-typedef struct cxsh_treeWalk_t {
-    corto_uint8 indent;
-    corto_uint32 count;
-}cxsh_treeWalk_t;
-
-/* Walk object-hierarchy */
-static int cxsh_treeWalk(corto_object o, void* userData) {
-    cxsh_treeWalk_t* data;
-
-    data = userData;
-
-    data->count++;
-
-    /* Limit name-buffer to local scope */
-    {
-        corto_id id1;
-        corto_string name;
-
-        /* Indentation */
-        if (*(corto_uint8*)userData) {
-            printf("%*s", data->indent * 2, "");
-        }
-
-        /* Object */
-        name = corto_nameof(o);
-        if (corto_parentof(corto_typeof(o)) == corto_lang_o) {
-            printf("%s%s%s %s", TYPE_COLOR, corto_nameof(corto_typeof(o)), NORMAL, name?name:"");
-        } else {
-            printf("%s%s%s %s", TYPE_COLOR, corto_fullname(corto_typeof(o), id1), NORMAL, name?name:"");
-        }
-
-        /* Scope operator */
-        if (scope && corto_scopeSize(o)) {
-            printf("%s::%s\n", BOLD, NORMAL);
-        } else {
-            printf("\n");
+        while (corto_iterHasNext(&iter)) {
+            corto_result *item = corto_iterNext(&iter);
+            cxsh_printRow(item->parent, item->name, item->type);
+            i ++;
         }
     }
 
-    /* Do recursive scopewalk */
-    data->indent++;
-    corto_scopeWalk(o, cxsh_treeWalk, userData);
-    data->indent--;
-
-    return 1;
-}
-
-/* Print object hierarchy */
-static void cxsh_tree(char* arg) {
-    corto_object o;
-    cxsh_treeWalk_t walkData;
-
-    if (arg && strlen(arg)) {
-        o = corto_resolve(scope, arg);
-        if (!o) {
-            cxsh_color(ERROR_COLOR);
-            corto_error("expression '%s' did not resolve to object.", arg);
-            cxsh_color(NORMAL);
-            return;
-        }
+    if (!i) {
+        corto_print("  no objects.");
+    } else if (i > 1) {
+        corto_print("  %d objects\n", i);
     } else {
-        o = scope;
-        corto_claim(o);
+        corto_print("  %d object\n", i);
     }
-
-    walkData.indent = 0;
-    walkData.count = 0;
-    cxsh_treeWalk(o, &walkData);
-
-    printf("total: %d objects.\n", walkData.count);
-
-    corto_release(o);
 }
 
 /* Navigate scopes */
 static void cxsh_cd(char* arg) {
-    corto_object o;
-    corto_object oldScope;
+    if (!arg || !strcmp(arg, "/")) {
+        strcpy(scope, "/");
+    } else {
+        corto_id request;
+        corto_resultIter iter;
+        corto_int32 count = 0;
 
-    oldScope = scope;
+        sprintf(request, "%s/%s", scope, arg);
 
-    if (!strlen(arg)) {
-        scope = root_o;
-        corto_claim(scope);
-    } else if (!strcmp(arg, "..")) {
-        if (corto_parentof(scope)) {
-            scope = corto_parentof(scope);
-        } else {
-            cxsh_color(ERROR_COLOR);
-            corto_error("scope is root.");
-            cxsh_color(NORMAL);
+        /* Trim trailing / to prevent scope selection */
+        if (request[strlen(request) - 1] == '/') {
+            request[strlen(request) - 1] = '\0';
+        }
+
+        if (corto_select(root_o, request, &iter)) {
+            corto_error("invalid argument: '%s'", arg);
             return;
         }
-        corto_claim(scope);
-    } else {
-        o = corto_resolve(scope, arg);
-        if (o) {
-            scope = o;
+
+        /* Reuse request to temporarily store result, count results */
+        corto_resultIterForeach(iter, e) {
+            if (count) {
+                corto_error("more than one result returned by 'cd %s'", arg);
+                return;
+            }
+            sprintf(request, "%s/%s", e.parent, e.name);
+            count++;
+        }
+
+        if (count == 1) {
+            strcpy(scope, request);
+            corto_cleanpath(scope);
         } else {
-            cxsh_color(ERROR_COLOR);
-            corto_error("expression '%s' did not resolve to object.", arg);
-            cxsh_color(NORMAL);
-            return;
+            corto_error("unresolved object '%s'", arg);
         }
     }
-
-    corto_release(oldScope);
 }
 
 corto_bool cxsh_readline(corto_string cmd) {
@@ -398,10 +340,10 @@ static corto_string cxsh_multiline(corto_string expr, corto_uint32 indent) {
     unsigned int len = strlen(expr);
     unsigned int multiline = 0;
 
-    if (expr[len-1] == ':') {
+    if (len && expr[len-1] == ':') {
         unsigned int cmdLen = 0;
         corto_id prompt;
-        cxsh_prompt(scope, FALSE, prompt);
+        cxsh_prompt(FALSE, prompt);
         multiline = 1;
 
         do {
@@ -457,41 +399,71 @@ static int cxsh_show(char* object) {
     corto_string_ser_t sdata;
     corto_value result;
     char *expr = object;
+    corto_object scope_o = NULL;
 
     memset(&result, 0, sizeof(corto_value));
 
     /* Check whether this is a multiline expression */
     expr = cxsh_multiline(corto_strdup(object), 1);
+    scope_o = corto_resolve(root_o, scope);
+    if (!scope_o) {
+        corto_seterr("invalid scope '%s'", scope);
+        return -1;
+    }
 
-    if (!corto_expr(scope, expr, &result)) {
+    if (!corto_expr(scope_o, expr, &result)) {
         corto_object o = NULL;
         if (result.kind == CORTO_OBJECT) {
             o = corto_valueObject(&result);
         }
 
+        /* Release scope as soon as possible */
+        corto_release(scope_o);
+
         /* Print object properties */
         if (o) {
             if (corto_checkAttr(o, CORTO_ATTR_SCOPED)) {
-                printf("%sname:%s         %s%s%s\n", INTERFACE_COLOR, NORMAL, OBJECT_COLOR, corto_fullname(o, id), NORMAL);
-                printf("%sparent:       %s%s%s\n", INTERFACE_COLOR, OBJECT_COLOR, corto_fullname(corto_parentof(o), id), NORMAL);
+                if (o == root_o) {
+                    printf("%sname:%s         %s/%s\n",
+                      INTERFACE_COLOR, NORMAL, OBJECT_COLOR, NORMAL);
+                } else {
+                    printf("%sname:%s         %s%s%s\n",
+                      INTERFACE_COLOR,
+                      NORMAL,
+                      OBJECT_COLOR,
+                      corto_nameof(o),
+                      NORMAL);
+                }
+                if (o != root_o) {
+                    char *parentPtr = corto_fullpath(id, corto_parentof(o));
+                    if (strcmp(parentPtr, "/")) {
+                        parentPtr += 1;
+                    }
+                    printf("%sparent:       %s%s%s\n",
+                      INTERFACE_COLOR, OBJECT_COLOR,
+                      parentPtr,
+                      NORMAL);
+                }
             }
             if (corto_checkAttr(o, CORTO_ATTR_PERSISTENT)) {
-                corto_time t = corto_timestampof(o);
                 corto_object owner = corto_ownerof(o);
-                corto_id ownerId;
-                printf("%stimestamp:%s    %d.%.9d%s\n", INTERFACE_COLOR, GREEN, t.tv_sec, t.tv_nsec, NORMAL);
 
                 if (corto_checkState(o, CORTO_DEFINED)) {
-                    printf("%sowner:%s        %s%s\n", 
-                        INTERFACE_COLOR, 
+                    printf("%sowner:%s        %s%s\n",
+                        INTERFACE_COLOR,
                         OBJECT_COLOR,
-                        owner ? corto_fullname(owner, ownerId) : "<this>",
+                        owner ? corto_fullpath(NULL, owner) : "<this>",
                         NORMAL);
                 }
-            } 
-            printf("%sstate:%s        %s%s%s\n", INTERFACE_COLOR, NORMAL, META_COLOR, cxsh_stateStr(o, state), NORMAL);
+            }
+            if (corto_checkState(o, CORTO_VALID)) {
+                printf("%sstate:%s        %s%s%s\n", INTERFACE_COLOR, NORMAL, META_COLOR, cxsh_stateStr(o, state), NORMAL);
+            } else {
+                printf("%sstate:        %s%s\n", RED, cxsh_stateStr(o, state), NORMAL);
+            }
             printf("%sattributes:%s   %s%s%s\n", INTERFACE_COLOR, NORMAL, META_COLOR, cxsh_attrStr(o, attr), NORMAL);
-            printf("%stype:%s         %s%s%s\n", INTERFACE_COLOR, NORMAL, OBJECT_COLOR, corto_fullname(corto_valueType(&result), id), NORMAL);
+            printf("%stype:%s         %s%s%s\n", INTERFACE_COLOR, NORMAL, OBJECT_COLOR,
+                corto_fullpath(NULL, corto_valueType(&result)) + 1, NORMAL);
         }
 
         /* Initialize serializer userData */
@@ -532,6 +504,7 @@ static int cxsh_show(char* object) {
         corto_dealloc(expr);
         return 0;
     } else {
+        corto_release(scope_o);
         corto_dealloc(expr);
         return -1;
     }
@@ -543,17 +516,19 @@ static void cxsh_import(char* file) {
 }
 
 /* Drop scope */
-static void cxsh_drop(char* name) {
+static void cxsh_delete(char* name) {
+    corto_id id;
     corto_object o;
 
-    o = corto_resolve(scope, name);
+    sprintf(id, "%s/%s", scope, name);
+
+    o = corto_resolve(root_o, id);
     if (o) {
-        corto_drop(o);
+        corto_delete(o);
         corto_release(o);
     } else {
-        cxsh_color(ERROR_COLOR);
-        corto_error("expression '%s' did not resolve to object.", scope);
-        cxsh_color(NORMAL);
+        corto_error("expression '%s' did not resolve to object.", id);
+        printf("\n");
     }
 }
 
@@ -566,9 +541,9 @@ static void cxsh_help(void) {
     printf("command with an '\\'.\n");
     printf("\n");
     printf("%sAvailable commands:%s\n", HEADER_COLOR, NORMAL);
-    printf("  %sls [scope]%s\n", HEADER_COLOR, NORMAL);
-    printf("      List contents of a scope. If no scope is provided the\n");
-    printf("      contents of the current scope is listed.\n");
+    printf("  %sls [expr]%s\n", HEADER_COLOR, NORMAL);
+    printf("      Lists result of select expression. If no expression is\n");
+    printf("      provided, ls lists the contents of the current scope.\n");
     printf("  %stree [scope]%s\n", HEADER_COLOR, NORMAL);
     printf("      Lists contents of a scope recursively. If no scope is\n");
     printf("      provided the current scope is listed.\n");
@@ -583,10 +558,15 @@ static void cxsh_help(void) {
     printf("      Exit database shell.\n");
     printf("\n");
     printf("%sExamples:%s\n", HEADER_COLOR, NORMAL);
-    printf("  %s$%s ls corto::lang\n", SHELL_COLOR, NORMAL);
-    printf("      List objects in scope 'corto::lang'\n");
-    printf("  %s$%s corto::lang::class\n", SHELL_COLOR, NORMAL);
-    printf("      Display object 'corto::lang::class'\n");
+    printf("  %s$%s ls corto/lang\n", SHELL_COLOR, NORMAL);
+    printf("      List objects in scope 'corto/lang'\n");
+    printf("  %s$%s ls //w*\n", SHELL_COLOR, NORMAL);
+    printf("      Lists all objects that start with the letter 'w'\n");
+    printf("  %s$%s corto/lang/class\n", SHELL_COLOR, NORMAL);
+    printf("      Display object 'corto/lang/class'\n");
+    printf("  %s$%s class.base\n", SHELL_COLOR, NORMAL);
+    printf("      Resolves 'base' member of class object. Requires the corto\n");
+    printf("      scripting language to be installed.\n");
     printf("\n");
 }
 
@@ -604,65 +584,55 @@ int cxsh_getErrorLocation(corto_string str) {
     return result;
 }
 
-static int cxsh_doCmd(char* cmd) {
-    char arg[CXSH_CMD_MAX];
-
-    arg[0] = '\0';
+static int cxsh_doCmd(int argc, char* argv[], char *cmd) {
+    CORTO_UNUSED(argc);
 
     /* ls */
-    if (((sscanf(cmd, "ls %s", arg) == 1) && (cmd[2] == ' ')) || !strcmp(cmd, "ls")) {
-        cxsh_ls(arg);
-    } else
-    /* tree */
-    if (((sscanf(cmd, "tree %s", arg) == 1) && (cmd[4] == ' ')) || !strcmp(cmd, "tree")) {
-        cxsh_tree(arg);
+    if (!strcmp(argv[0], "ls")) {
+      cxsh_ls(argv[1]);
     } else
     /* exit */
-    if (!memcmp(cmd, "exit", strlen("exit"))) {
+    if (!strcmp(argv[0], "exit")) {
+        printf("Bye!\n");
         goto quit;
     } else
     /* cd */
-    if (((sscanf(cmd, "cd %s", arg) == 1) && (cmd[2] == ' ')) || !strcmp(cmd, "cd")) {
-        cxsh_cd(arg);
+    if (!strcmp(argv[0], "cd")) {
+        cxsh_cd(argv[1]);
     } else
     /* import */
-    if (!memcmp(cmd, "import ", strlen("import "))) {
-        sscanf(cmd, "import %s", arg);
-        cxsh_import(arg);
-    } else/* drop */
-    if (!memcmp(cmd, "drop ", strlen("drop "))) {
-        sscanf(cmd, "drop %s", arg);
-        cxsh_drop(arg);
-    } else if (!memcmp(cmd, "clear", strlen("clear"))) {
+    if (!strcmp(argv[0], "import")) {
+        cxsh_import(argv[1]);
+    } else
+    /* drop */
+    if (!strcmp(argv[0], "delete")) {
+        cxsh_delete(argv[1]);
+    } else
+    /* clear */
+    if (!strcmp(argv[0], "clear")) {
         system("clear");
-    } else if (!memcmp(cmd, "help", strlen("help"))) {
+    } else
+    /* help */
+    if (!strcmp(argv[0], "help")) {
         cxsh_help();
     } else {
         corto_char *lastErr;
 
-        if (*cmd == '/') {
-            cmd++;
-        }
-
         if (cxsh_show(cmd)) {
             if ((lastErr = corto_lasterr())) {
                 unsigned int location = 0;
-                cxsh_color(ERROR_COLOR);
 
                 /* If lastError starts with a line:column: indication, print an arrow */
                 if ((location = cxsh_getErrorLocation(lastErr))) {
                     corto_id prompt;
-                    cxsh_prompt(scope, FALSE, prompt);
-                    printf("%*s^\n", location - 1 + (unsigned int)strlen(prompt), "");
+                    cxsh_prompt(FALSE, prompt);
                     lastErr = strchr(lastErr, ':') + 2;
+                    corto_error("%*s^\n%s", location - 1 + (unsigned int)strlen(prompt), "", lastErr);
+                } else {
+                    corto_error("error: %s", lastErr);
                 }
-
-                corto_print("%s", lastErr);
-                cxsh_color(NORMAL);
             } else {
-                cxsh_color(ERROR_COLOR);
-                corto_print("'%s' does not resolve to a valid object or expression", cmd);
-                cxsh_color(NORMAL);
+                corto_error("'%s' does not resolve to a valid object or expression", cmd);
             }
         }
     }
@@ -672,37 +642,389 @@ quit:
     return 1;
 }
 
+typedef struct cxsh_memberSer_t {
+    char *prefix;
+    char *filter;
+    corto_ll results;
+} cxsh_memberSer_t;
+
+static corto_int16 cxsh_ser_member(
+  corto_serializer s,
+  corto_value *info,
+  void *userData)
+{
+    cxsh_memberSer_t *data = userData;
+    corto_string m = corto_nameof(info->is.member.t);
+    CORTO_UNUSED(s);
+
+    if (m && !fnmatch(data->filter, m, 0)) {
+        corto_id str;
+        sprintf(str, "%s.%s", data->prefix, m);
+        corto_llAppend(data->results, corto_strdup(str));
+    }
+
+    return 0;
+}
+
+/* Resolve members for type */
+struct corto_serializer_s cxsh_memberSer(void) {
+    struct corto_serializer_s s;
+
+    corto_serializerInit(&s);
+
+    s.access = CORTO_PRIVATE | CORTO_HIDDEN;
+    s.accessKind = CORTO_NOT;
+    s.traceKind = CORTO_SERIALIZER_TRACE_ON_FAIL;
+    s.metaprogram[CORTO_MEMBER] = cxsh_ser_member;
+    return s;
+}
+
+/* Obtain type of expression */
+corto_type cxsh_exprType(corto_string expr) {
+    corto_type result = NULL;
+    corto_function parseLine =
+        corto_resolve(NULL, "/corto/ast/Parser/parseType");
+
+    if (parseLine) {
+        corto_object scope_o = corto_resolve(root_o, scope);
+        if (!scope_o) {
+            return NULL;
+        }
+        corto_call(parseLine, &result, expr, scope_o);
+        corto_release(scope_o);
+    }
+
+    return result;
+}
+
+
+/* Return result for TAB expansion */
+corto_ll cxsh_shellExpand(int argc, const char* argv[], char *cmd) {
+    corto_ll result = corto_llNew();
+    corto_iter iter;
+    corto_id expr;
+
+    /* If there is no space between command and first
+     * arg, space must be inserted */
+    corto_bool firstArgSpace =
+      argc == 1 ? cmd[strlen(cmd) - 1] == ' ' : TRUE;
+
+    /* For selection of scopes, auto-append a '/' */
+    corto_bool appendSlash = FALSE;
+
+    if (argc) {
+        if (!strcmp(argv[0], "cd") || !strcmp(argv[0], "ls")) {
+            appendSlash = TRUE;
+            if (argc >= 2) {
+                strcpy(expr, argv[1]);
+            } else {
+                strcpy(expr, "");
+            }
+
+            /* If first argument doesn't end with a space, insert space on first
+             * tab. */
+            if (!firstArgSpace) {
+                corto_llFree(result);
+                result = NULL;
+            } else {
+                strcat(expr, "*");
+            }
+        } else {
+            strcpy(expr, cmd);
+            strcat(expr, "*");
+        }
+    } else {
+        strcpy(expr, "*");
+    }
+
+    if (result) {
+        char *ptr, *memberPtr = NULL;
+        ptr = expr;
+
+        /* Find last member expression */
+        if (ptr) {
+            while ((ptr = strchr(ptr + 1, '.'))) {
+                memberPtr = ptr;
+            }
+        }
+
+        if (memberPtr) {
+            corto_id objExpr; strcpy(objExpr, expr);
+            objExpr[memberPtr - expr] = '\0';
+            corto_id filter; strcpy(filter, &expr[memberPtr - expr + 1]);
+            corto_type t = NULL;
+            if ((t = cxsh_exprType(objExpr))) {
+                if (corto_instanceof(corto_interface_o, t)) {
+                    cxsh_memberSer_t walkData = {objExpr, filter, result};
+
+                    /* Add members to auto complete */
+                    struct corto_serializer_s ser = cxsh_memberSer();
+                    corto_metaWalk(&ser, t, &walkData);
+
+                    /* Add methods to auto complete */
+                    corto_vtableForeach(corto_interface(t)->methods, m) {
+                        corto_id method, sigName;
+                        corto_signatureName(corto_nameof(m), sigName);
+                        if (!fnmatch(filter, sigName, 0)) {
+                            sprintf(method, "%s.%s(", objExpr, sigName);
+                            corto_llAppend(result, corto_strdup(method));
+                        }
+                    }
+                }
+            }
+        } else {
+            corto_int32 i = 0;
+            corto_id scopedExpr;
+            if (strcmp(scope, "/")) {
+                sprintf(scopedExpr, "%s/%s", scope, expr);
+            } else {
+                strcpy(scopedExpr, expr);
+            }
+            corto_select(root_o, scopedExpr, &iter);
+            while (corto_iterHasNext(&iter)) {
+                corto_result *item = corto_iterNext(&iter);
+                corto_id scopedItem;
+                cxsh_pathstr(scopedItem, item->parent, item->name);
+                if (appendSlash) {
+                    strcat(scopedItem, "/");
+                }
+                corto_llAppend(result, corto_strdup(scopedItem));
+                i++;
+            }
+
+            if (!i) {
+                corto_select(corto_o, expr, &iter);
+                while (corto_iterHasNext(&iter)) {
+                    corto_result *item = corto_iterNext(&iter);
+                    corto_id scopedItem;
+                    if (strcmp(item->parent, ".")) {
+                        sprintf(scopedItem, "corto/%s/%s", item->parent, item->name);
+                    } else {
+                        sprintf(scopedItem, "corto/%s", item->name);
+                    }
+                    if (appendSlash) {
+                        strcat(scopedItem, "/");
+                    }
+                    corto_llAppend(result, corto_strdup(scopedItem));
+                    i++;
+                }
+            }
+
+            if (!i) {
+                corto_select(corto_lang_o, expr, &iter);
+                while (corto_iterHasNext(&iter)) {
+                    corto_result *item = corto_iterNext(&iter);
+                    corto_id scopedItem;
+                    if (strcmp(item->parent, ".")) {
+                        sprintf(scopedItem, "corto/lang/%s/%s", item->parent, item->name);
+                    } else {
+                        sprintf(scopedItem, "corto/lang/%s", item->name);
+                    }
+                    if (appendSlash) {
+                        strcat(scopedItem, "/");
+                    }
+                    corto_llAppend(result, corto_strdup(scopedItem));
+                    i++;
+                }
+            }
+        }
+
+        if (!argc || !firstArgSpace) {
+            if (!fnmatch(expr, "cd", 0)) corto_llAppend(result, corto_strdup ("cd"));
+            if (!fnmatch(expr, "ls", 0)) corto_llAppend(result, corto_strdup ("ls"));
+            if (!fnmatch(expr, "tree", 0)) corto_llAppend(result, corto_strdup ("tree"));
+            if (!fnmatch(expr, "delete", 0)) corto_llAppend(result, corto_strdup ("delete"));
+            if (!fnmatch(expr, "import", 0)) corto_llAppend(result, corto_strdup ("import"));
+            if (!fnmatch(expr, "exit", 0)) corto_llAppend(result, corto_strdup ("exit"));
+            if (!fnmatch(expr, "clear", 0)) corto_llAppend(result, corto_strdup ("clear"));
+            if (!fnmatch(expr, "help", 0)) corto_llAppend(result, corto_strdup ("help"));
+        }
+    }
+
+    return result;
+}
+
+/* Execute command */
+int cxsh_command(int argc, char* argv[], char *cmd) {
+    return cxsh_doCmd(argc, argv, cmd);
+}
+
+/* Count number of results from select */
+corto_uint32 cxsh_countSelect(char *expr) {
+    corto_uint32 result = 0;
+    corto_iter iter;
+    if (!corto_select(corto_lang_o, expr, &iter)) {
+        while (corto_iterHasNext(&iter)) {
+            result++;
+            break;
+        }
+    }
+    if (!result) {
+        if (!corto_select(corto_o, expr, &iter)) {
+            while (corto_iterHasNext(&iter)) {
+                corto_iterNext(&iter);
+                result++;
+                break;
+            }
+        }
+    }
+    if (!result) {
+        corto_id scopedExpr;
+        if (strcmp(scope, "/")) {
+            sprintf(scopedExpr, "%s/%s", scope, expr);
+        } else {
+            strcpy(scopedExpr, expr);
+        }
+        if (!corto_select(root_o, scopedExpr, &iter)) {
+            while (corto_iterHasNext(&iter)) {
+                corto_iterNext(&iter);
+                result++;
+                break;
+            }
+        }
+    }
+    return result;
+}
+
+/* Print command */
+int cxsh_printCommand(char* buff) {
+    if (!strcmp(buff, "cd") ||
+      !strcmp(buff, "ls") ||
+      !strcmp(buff, "tree") ||
+      !strcmp(buff, "exit") ||
+      !strcmp(buff, "import") ||
+      !strcmp(buff, "delete") ||
+      !strcmp(buff, "help") ||
+      !strcmp(buff, "clear")) {
+        printf("%s%s%s", BOLD, buff, NORMAL);
+        return 1;
+    } else {
+        return 0;
+    }
+}
+
+/* Print single object */
+void cxsh_printObject(char *expr, char *str) {
+    corto_uint32 count = cxsh_countSelect(expr);
+    if (count) {
+        printf("%s%s%s", CYAN, str, NORMAL);
+    } else {
+        printf("%s", str);
+    }
+}
+
+/* Print single object */
+void cxsh_printMember(char *expr, char *str) {
+    if (cxsh_exprType(expr)) {
+        printf("%s%s%s", BLUE, str, NORMAL);
+    } else {
+        printf("%s", str);
+    }
+}
+
+/* Color-code command */
+void cxsh_print(const char *arg) {
+    corto_id buff, expr;
+    const char *ptr = arg;
+    char *bptr = buff, *exprPtr = expr, ch;
+    *exprPtr = '\0';
+    corto_uint32 token = 0;
+    corto_bool isMember = FALSE;
+
+    for (; (ch = *ptr); ptr ++) {
+        if ((ch == '/') ||
+            (ch == ' ') ||
+            (ch == '{') || (ch == '}') ||
+            (ch == '.') ||
+            (ch == ',') ||
+            (ch == '"') ||
+            (ch == '(') || (ch == ')') ||
+            (ch == '[') || (ch == ']')) {
+
+            *bptr = '\0';
+            if (token || !cxsh_printCommand(buff)) {
+                if (isMember) {
+                    cxsh_printMember(expr, buff);
+                } else {
+                    cxsh_printObject(expr, buff);
+                }
+            }
+            if (ch == '/') {
+                printf("%s%c%s", CYAN, ch, NORMAL);
+            } else if (ch == '"') {
+                printf("%s%c%s", RED, ch, NORMAL);
+            } else {
+                printf("%s%c%s", BOLD, ch, NORMAL);
+            }
+
+            bptr = buff;
+            token++;
+
+            if (ch == '"') {
+                while ((ch = *(++ptr)) && (ch != '"')) {
+                    *bptr = ch;
+                    bptr++;
+                }
+                if (ch) {
+                    *bptr = '"';
+                    bptr++;
+                }
+                *bptr = '\0';
+                printf("%s%s%s", RED, buff, NORMAL);
+                bptr = buff;
+            } else if (ch == '.') {
+                isMember = TRUE;
+            } else {
+                isMember = FALSE;
+            }
+        } else if ((bptr == buff) && isdigit(ch)) {
+            printf("%s%c%s", GREEN, ch, NORMAL);
+            bptr = buff;
+            token++;
+        } else {
+            *bptr++ = ch;
+        }
+        if ((ch == ' ') || (ch == '{')) {
+            exprPtr = expr;
+        } else {
+            *exprPtr++ = ch;
+        }
+        *exprPtr = '\0';
+    }
+    *bptr = '\0';
+    *exprPtr = '\0';
+    if (token || !cxsh_printCommand(buff)) {
+      if (isMember) {
+          cxsh_printMember(expr, buff);
+      } else {
+          cxsh_printObject(expr, buff);
+      }
+    }
+}
+
 /* Shell */
 static void cxsh_shell(void) {
-    char cmd[CXSH_CMD_MAX];
     corto_bool quit;
     corto_id prompt;
 
     quit = FALSE;
 
     while (!quit) {
-        /* Print prompt */
-        cxsh_prompt(scope, TRUE, prompt);
-        printf("%s", prompt);
+        /* Set prompt */
+        cxsh_prompt(TRUE, prompt);
+        corto_shellEngine_prompt(prompt);
 
-        if (!cxsh_readline(cmd)) {
-            if (feof(stdin)) {
-                printf("\n");
-                quit = TRUE;
-            }
-            continue;
-        }
-
-        /* Forward commands */
-        if (strlen(cmd)) {
-            if (cxsh_doCmd(cmd)) {
-                quit = TRUE;
-            }
+        /* Read input */
+        if (corto_shellEngine_readInput(
+          cxsh_print,
+          (corto_commandCallback)cxsh_command,
+          cxsh_shellExpand)) {
+            quit = TRUE;
         }
     }
 }
 
-int cortotool_shell(int argc, char* argv[]) {
+corto_int16 cortotool_shell(int argc, char* argv[]) {
     int i;
 
     cxsh_color(SHELL_COLOR);
@@ -719,13 +1041,9 @@ int cortotool_shell(int argc, char* argv[]) {
         }
     }
 
-    /* Assign scope to root */
-    scope = root_o;
-    corto_claim(root_o); /* Keep scope */
-
+    /* Set scope to root */
+    strcpy(scope, "/");
     cxsh_shell();
-
-    corto_release(scope); /* Free scope */
 
     return 0;
 }
